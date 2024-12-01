@@ -1,177 +1,220 @@
-clc, clear, close all;
+%% Fingerprint Recognition System
+% This script compares fingerprint recognition methods using minutiae and
+% texture-based feature extraction, classified with SVM and k-NN.
 
-% Define the path to the Data folder and output folder
-dataFolder = fullfile(pwd, 'Data'); % Path to raw data
-outputFolder = fullfile(dataFolder, 'Processed'); % Path to processed data
+%% Initialization
+clc; clear; close all;
 
-% Create the output folder if it doesn't exist
-if ~exist(outputFolder, 'dir')
-    mkdir(outputFolder);
+% Paths to data
+rawDataPath = './data';
+
+% Parameters
+numClasses = 100; % Number of fingerprint classes
+numSamplesPerClass = 8; % Samples per class
+
+%% Parallel Pool Setup
+% Start a parallel pool
+if isempty(gcp('nocreate'))
+    parpool; % Start a parallel pool with default workers
 end
 
-% Get a list of all fingerprint image files in the folder
-imageFiles = dir(fullfile(dataFolder, '*.tif'));
+%% Data Preparation
+% Initialize data containers
+labels = [];
+featuresMinutiae = [];
+featuresTexture = [];
 
-% Initialize arrays to store feature vectors and labels
-minutiaeFeatures = [];
-lbpFeatures = [];
-labels = []; % Ground truth labels (to be defined based on your dataset)
+% Preallocate cell arrays for parallel processing
+minutiaeCell = cell(numClasses * numSamplesPerClass, 1);
+textureCell = cell(numClasses * numSamplesPerClass, 1);
+labelCell = cell(numClasses * numSamplesPerClass, 1);
 
-% Loop through each image to extract features and generate labels
-for i = 1:length(imageFiles)
-    % Load the processed image
-    sampleImagePath = fullfile(outputFolder, [imageFiles(i).name(1:end-4) 'processed.tif']);
-    if ~exist(sampleImagePath, 'file')
-        continue;
+% Parallelized loop
+parfor idx = 1:(numClasses * numSamplesPerClass)
+    % Compute class and sample indices
+    classIdx = ceil(idx / numSamplesPerClass);
+    sampleIdx = mod(idx - 1, numSamplesPerClass) + 1;
+
+    % Construct file name
+    fileName = sprintf('%d_%d.tif', classIdx, sampleIdx);
+    filePath = fullfile(rawDataPath, fileName);
+
+    % Read and preprocess image
+    img = imread(filePath);
+    preprocessedImg = preprocessFingerprint(img);
+
+    % Feature extraction
+    minutiaeCell{idx} = extractMinutiaeFeatures(preprocessedImg);
+    textureCell{idx} = extractTextureFeatures(preprocessedImg);
+    labelCell{idx} = classIdx;
+end
+
+% Convert cell arrays to matrices
+featuresMinutiae = cell2mat(minutiaeCell);
+featuresTexture = cell2mat(textureCell);
+labels = cell2mat(labelCell);
+
+%% Split Data into Training and Testing Sets
+% Use 70% for training and 30% for testing
+[trainIdx, testIdx] = crossvalind('HoldOut', labels, 0.3);
+
+trainLabels = labels(trainIdx);
+testLabels = labels(testIdx);
+
+trainMinutiae = featuresMinutiae(trainIdx, :);
+testMinutiae = featuresMinutiae(testIdx, :);
+
+trainTexture = featuresTexture(trainIdx, :);
+testTexture = featuresTexture(testIdx, :);
+
+%% Classification and Performance Evaluation
+% Initialize storage for results
+results = struct();
+
+% Classifiers
+classifiers = {'SVM', 'kNN'};
+methods = {'Minutiae', 'Texture'};
+
+figure; hold on; grid on;
+colors = {'r', 'b', 'g', 'k'}; % Colors for each ROC curve
+legendEntries = {};
+
+for methodIdx = 1:length(methods)
+    for classifierIdx = 1:length(classifiers)
+        % Select features and classifier
+        if methodIdx == 1
+            trainData = trainMinutiae;
+            testData = testMinutiae;
+        else
+            trainData = trainTexture;
+            testData = testTexture;
+        end
+
+        if classifierIdx == 1
+            % Train SVM (using fitcecoc for multiclass support)
+            model = fitcecoc(trainData, trainLabels, 'Coding', 'onevsall', 'Learners', templateSVM('KernelFunction', 'linear'));
+            [predictions, scores] = predict(model, testData);
+        else
+            % Train k-NN
+            model = fitcknn(trainData, trainLabels, 'NumNeighbors', 5);
+            [predictions, scores] = predict(model, testData);
+        end
+
+        % Evaluate performance
+        [X, Y, T, AUC] = perfcurve(testLabels, scores(:, 2), 1);
+
+        % Store results
+        results.(methods{methodIdx}).(classifiers{classifierIdx}) = struct(...
+            'X', X, 'Y', Y, 'AUC', AUC);
+
+        % Get ROC data
+        X = results.(methods{methodIdx}).(classifiers{classifierIdx}).X;
+        Y = results.(methods{methodIdx}).(classifiers{classifierIdx}).Y;
+        AUC = results.(methods{methodIdx}).(classifiers{classifierIdx}).AUC;
+
+        % Plot ROC curve
+        plot(X, Y, 'LineWidth', 1.5, 'Color', colors{(methodIdx - 1) * 2 + classifierIdx});
+        
+        % Add to legend
+        legendEntries{end + 1} = sprintf('%s + %s (AUC: %.2f)', methods{methodIdx}, classifiers{classifierIdx}, AUC);
     end
-    
-    sampleImage = imread(sampleImagePath);
-    
-    % Convert to grayscale if not already
-    if size(sampleImage, 3) == 3
-        sampleImage = rgb2gray(sampleImage);
-    end
-    
-    % 1. **Minutiae-Based Feature Extraction**
-    binarySample = imbinarize(sampleImage);
-    thinnedSample = bwmorph(binarySample, 'thin', Inf);
-    [minutiaePoints, minutiaeType] = detectMinutiae(thinnedSample);
-    minutiaeHistogram = createMinutiaeHistogram(minutiaePoints, size(sampleImage));
-    minutiaeFeatures = [minutiaeFeatures; minutiaeHistogram];
-    
-    % 2. **Texture-Based Feature Extraction (LBP)**
-    radius = 1; % Radius for LBP
-    numNeighbors = 8; % Number of neighbors for LBP
-    lbpFeaturesVector = extractLBPFeatures(sampleImage, 'Radius', radius, 'NumNeighbors', numNeighbors);
-    lbpFeatures = [lbpFeatures; lbpFeaturesVector];
-    
-    % Add label (1 for true, 0 for false or according to your dataset)
-    labels = [labels; 1]; % Adjust based on your dataset's ground truth
 end
 
-% Split data into training and testing sets
-cv = cvpartition(labels, 'HoldOut', 0.3); % 70% training, 30% testing
-trainIdx = cv.training();
-testIdx = cv.test();
-
-% Train and test the classifiers for minutiae-based features
-minutiaeTrainData = minutiaeFeatures(trainIdx, :);
-minutiaeTestData = minutiaeFeatures(testIdx, :);
-minutiaeTrainLabels = labels(trainIdx);
-minutiaeTestLabels = labels(testIdx);
-
-% Train SVM for minutiae-based features
-svmMinutiae = fitcsvm(minutiaeTrainData, minutiaeTrainLabels, 'KernelFunction', 'linear', 'Probability', true);
-[~, scoreMinutiae] = predict(svmMinutiae, minutiaeTestData);
-
-% Evaluate performance for minutiae-based method
-if size(confusionmat(minutiaeTestLabels, predict(svmMinutiae, minutiaeTestData)), 1) > 1
-    minutiaeConfMatrix = confusionmat(minutiaeTestLabels, predict(svmMinutiae, minutiaeTestData));
-    minutiaeAccuracy = sum(diag(minutiaeConfMatrix)) / sum(minutiaeConfMatrix(:));
-    minutiaeTPR = minutiaeConfMatrix(2, 2) / sum(minutiaeConfMatrix(2, :)); % True Positive Rate
-    minutiaeFPR = minutiaeConfMatrix(1, 2) / sum(minutiaeConfMatrix(1, :)); % False Positive Rate
-else
-    minutiaeTPR = NaN;
-    minutiaeFPR = NaN;
-    fprintf('Confusion matrix for minutiae-based method is single-class. TPR and FPR not calculated.\n');
-end
-
-% Plot ROC curve for minutiae-based method
-[Xminutiae, Yminutiae, ~, AUCminutiae] = perfcurve(minutiaeTestLabels, scoreMinutiae(:, 2), 'trueclass', 1);
-
-% Train and test the classifiers for texture-based features (LBP)
-lbpTrainData = lbpFeatures(trainIdx, :);
-lbpTestData = lbpFeatures(testIdx, :);
-lbpTrainLabels = labels(trainIdx);
-lbpTestLabels = labels(testIdx);
-
-% Train SVM for LBP features
-svmLBP = fitcsvm(lbpTrainData, lbpTrainLabels, 'KernelFunction', 'linear', 'Probability', true);
-[~, scoreLBP] = predict(svmLBP, lbpTestData);
-
-% Evaluate performance for LBP-based method
-if size(confusionmat(lbpTestLabels, predict(svmLBP, lbpTestData)), 1) > 1
-    lbpConfMatrix = confusionmat(lbpTestLabels, predict(svmLBP, lbpTestData));
-    lbpAccuracy = sum(diag(lbpConfMatrix)) / sum(lbpConfMatrix(:));
-    lbpTPR = lbpConfMatrix(2, 2) / sum(lbpConfMatrix(2, :)); % True Positive Rate
-    lbpFPR = lbpConfMatrix(1, 2) / sum(lbpConfMatrix(1, :)); % False Positive Rate
-else
-    lbpTPR = NaN;
-    lbpFPR = NaN;
-    fprintf('Confusion matrix for LBP-based method is single-class. TPR and FPR not calculated.\n');
-end
-
-% Plot ROC curve for LBP-based method
-[Xlbp, Ylbp, ~, AUClbp] = perfcurve(lbpTestLabels, scoreLBP(:, 2), 'trueclass', 1);
-
-% Display results
-fprintf('Minutiae-based method accuracy: %.2f%%\n', minutiaeAccuracy * 100);
-fprintf('Minutiae-based method TPR: %.2f\n', minutiaeTPR);
-fprintf('Minutiae-based method FPR: %.2f\n', minutiaeFPR);
-fprintf('LBP-based method accuracy: %.2f%%\n', lbpAccuracy * 100);
-fprintf('LBP-based method TPR: %.2f\n', lbpTPR);
-fprintf('LBP-based method FPR: %.2f\n', lbpFPR);
-
-% Plot ROC curves
-figure;
-plot(Xminutiae, Yminutiae, 'b', 'DisplayName', 'Minutiae-based ROC');
-hold on;
-plot(Xlbp, Ylbp, 'r', 'DisplayName', 'LBP-based ROC');
+% Customize the plot
+title('Comparison of ROC Curves');
 xlabel('False Positive Rate');
 ylabel('True Positive Rate');
-title('ROC Curve Comparison');
-legend('show');
-grid on;
+legend(legendEntries, 'Location', 'SouthEast');
 
-% Function to detect minutiae points (ridge endings and bifurcations)
-function [minutiaePoints, minutiaeType] = detectMinutiae(binaryImg)
-    [rows, cols] = size(binaryImg);
-    minutiaePoints = [];
-    minutiaeType = [];
+%% Cleanup Parallel Pool
+% Shut down the parallel pool after completion
+delete(gcp);
 
-    % Loop through each pixel to detect minutiae
-    for r = 2:rows-1
-        for c = 2:cols-1
-            if binaryImg(r, c) == 1
-                % Analyze the 3x3 neighborhood
-                neighborhood = binaryImg(r-1:r+1, c-1:c+1);
-                numOnPixels = sum(neighborhood(:));
+%% Helper Functions
+function features = extractMinutiaeFeatures(img)
 
-                % Check for ridge endings (1 on pixel and 3 on neighbors)
-                if numOnPixels == 2
-                    minutiaePoints = [minutiaePoints; r, c];
-                    minutiaeType = [minutiaeType; 'E']; % 'E' for ridge ending
-                % Check for bifurcations (1 on pixel and 4 on neighbors)
-                elseif numOnPixels == 3
-                    minutiaePoints = [minutiaePoints; r, c];
-                    minutiaeType = [minutiaeType; 'B']; % 'B' for bifurcation
+    if ~islogical(img)
+        binary_image = imbinarize(img); % Only binarize if the image is not binary
+    else
+        binary_image = img; % Keep the image as-is if it's already binary
+    end
+
+    % Get image size
+    [rows, cols] = size(binary_image);
+    
+    % Define cropping region
+    startRow = min(120, rows); % Ensure startRow doesn't exceed the number of rows
+    endRow = min(400, rows);  % Ensure endRow doesn't exceed the number of rows
+    startCol = min(20, cols); % Ensure startCol doesn't exceed the number of columns
+    endCol = min(250, cols);  % Ensure endCol doesn't exceed the number of columns
+    
+    % Adjust region dynamically based on image size
+    binary_image = binary_image(startRow:endRow, startCol:endCol);
+    
+    % Thinning
+    thin_image = ~bwmorph(binary_image, 'thin', Inf);
+    
+    % Minutiae extraction
+    s = size(thin_image);
+    N = 3; % Window size
+    n = (N - 1) / 2;
+    r = s(1) + 2 * n;
+    c = s(2) + 2 * n;
+    temp = zeros(r, c);
+    ridge = zeros(r, c);
+    bifurcation = zeros(r, c);
+    temp((n + 1):(end - n), (n + 1):(end - n)) = thin_image;
+    
+    for x = (n + 1 + 10):(s(1) + n - 10)
+        for y = (n + 1 + 10):(s(2) + n - 10)
+            e = 1;
+            for k = x - n:x + n
+                f = 1;
+                for l = y - n:y + n
+                    mat(e, f) = temp(k, l);
+                    f = f + 1;
                 end
+                e = e + 1;
+            end
+            if mat(2, 2) == 0
+                ridge(x, y) = sum(sum(~mat));
+                bifurcation(x, y) = sum(sum(~mat));
             end
         end
     end
+    
+    % Ridge and bifurcation counts
+    ridge_count = length(find(ridge == 2));
+    bifurcation_count = length(find(bifurcation == 4));
+    
+    % Combine features
+    features = [ridge_count, bifurcation_count];
 end
 
-% Function to create a histogram of minutiae points
-function minutiaeHistogram = createMinutiaeHistogram(minutiaePoints, imageSize)
-    % Initialize a histogram vector (e.g., 10 bins for simplicity)
-    numBins = 10; % Adjust as needed for your application
-    minutiaeHistogram = zeros(1, numBins);
 
-    % Define the grid size for partitioning the image
-    binWidth = floor(imageSize(2) / numBins);
-    binHeight = floor(imageSize(1) / numBins);
-
-    % Loop through each minutiae point and count it in the appropriate bin
-    for i = 1:size(minutiaePoints, 1)
-        r = minutiaePoints(i, 1);
-        c = minutiaePoints(i, 2);
-        
-        % Calculate which bin the point falls into based on its coordinates
-        binIndex = min(floor(c / binWidth) + 1, numBins);
-        % Optionally, add logic for vertical bins if needed
-        % binIndex = min(floor(r / binHeight) + 1, numBins);
-
-        % Increment the count in the corresponding bin
-        minutiaeHistogram(binIndex) = minutiaeHistogram(binIndex) + 1;
+function features = extractTextureFeatures(img)
+    % Convert image to grayscale if needed
+    if size(img, 3) == 3
+        img = rgb2gray(img);
     end
+
+    % Extract LBP features
+    features = extractLBPFeatures(img, 'Upright', true, 'CellSize', [16 16]);
+end
+
+function preprocessedImg = preprocessFingerprint(img)
+    % Normalize image intensity
+    normalizedImg = mat2gray(img);
+
+    % Reduce noise
+    filteredImg = medfilt2(normalizedImg, [3 3]);
+
+    % Enhance contrast
+    enhancedImg = adapthisteq(filteredImg);
+
+    % Binarize image
+    binaryImg = imbinarize(enhancedImg, adaptthresh(enhancedImg, 0.5));
+
+    % Thin ridges
+    preprocessedImg = bwmorph(binaryImg, 'thin', Inf);
 end
