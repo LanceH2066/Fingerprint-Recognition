@@ -55,9 +55,21 @@ for classIdx = 1:numClasses
 end
 
 %% Split Data into Training and Testing Sets
-% Use 70% for training and 30% for testing
-[trainIdx, testIdx] = crossvalind('HoldOut', labels, 0.3);
+% Preallocate indices for training and testing
+trainIdx = false(size(labels));
+testIdx = false(size(labels));
 
+for classIdx = 1:numClasses
+    % Calculate indices for the current class
+    classStartIdx = (classIdx - 1) * numSamplesPerClass + 1;
+    classEndIdx = classIdx * numSamplesPerClass;
+
+    % Select the first 6 images for training and the last 2 for testing
+    trainIdx(classStartIdx:classStartIdx+5) = true;
+    testIdx(classStartIdx+6:classEndIdx) = true;
+end
+
+% Assign data to training and testing sets
 trainLabels = labels(trainIdx);
 testLabels = labels(testIdx);
 
@@ -104,13 +116,13 @@ for methodIdx = 1:length(methods)
                 'Distance', 'euclidean', 'DistanceWeight', 'inverse', 'Standardize', true);
             [predictions, scores] = predict(model, testData);
         end
-        
+
         % Evaluate performance
         [X, Y, T, AUC] = perfcurve(testLabels, scores(:, 2), 1);
 
         % Store results
         results.(methods{methodIdx}).(classifiers{classifierIdx}) = struct(...
-        'X', X, 'Y', Y, 'AUC', AUC);
+            'X', X, 'Y', Y, 'AUC', AUC);
 
         % Get ROC data
         X = results.(methods{methodIdx}).(classifiers{classifierIdx}).X;
@@ -119,7 +131,7 @@ for methodIdx = 1:length(methods)
 
         % Plot ROC curve
         plot(X, Y, 'LineWidth', 1.5, 'Color', colors{(methodIdx - 1) * 2 + classifierIdx});
-        
+
         % Add to legend
         legendEntries{end + 1} = sprintf('%s + %s (AUC: %.2f)', methods{methodIdx}, classifiers{classifierIdx}, AUC);
     end
@@ -133,7 +145,6 @@ legend(legendEntries, 'Location', 'SouthEast');
 
 %% Helper Functions
 function features = extractMinutiaeFeatures(img)
-
     if ~islogical(img)
         binary_image = imbinarize(img); % Only binarize if the image is not binary
     else
@@ -191,7 +202,6 @@ function features = extractMinutiaeFeatures(img)
     % Combine features
     features = [ridge_count, bifurcation_count];
 end
-
 
 function features = extractTextureFeatures(img)
     % Convert image to grayscale if needed
