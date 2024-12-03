@@ -1,22 +1,18 @@
-%% Fingerprint Recognition System
-% This script compares fingerprint recognition methods using minutiae and
-% texture-based feature extraction, classified with SVM and k-NN.
-
 %% Initialization
 clc; clear; close all;
 
 % Paths to data
 rawDataPath = './data';
+processedDataPath = './data/processed';
+
+% Create processed folder if it doesn't exist
+if ~exist(processedDataPath, 'dir')
+    mkdir(processedDataPath);
+end
 
 % Parameters
 numClasses = 100; % Number of fingerprint classes
 numSamplesPerClass = 8; % Samples per class
-
-%% Parallel Pool Setup
-% Start a parallel pool
-if isempty(gcp('nocreate'))
-    parpool; % Start a parallel pool with default workers
-end
 
 %% Data Preparation
 % Initialize data containers
@@ -24,35 +20,39 @@ labels = [];
 featuresMinutiae = [];
 featuresTexture = [];
 
-% Preallocate cell arrays for parallel processing
-minutiaeCell = cell(numClasses * numSamplesPerClass, 1);
-textureCell = cell(numClasses * numSamplesPerClass, 1);
-labelCell = cell(numClasses * numSamplesPerClass, 1);
+for classIdx = 1:numClasses
+    for sampleIdx = 1:numSamplesPerClass
+        % Construct file name
+        rawFileName = sprintf('%d_%d.tif', classIdx, sampleIdx);
+        processedFileName = sprintf('%d_%d_processed.tif', classIdx, sampleIdx);
+        rawFilePath = fullfile(rawDataPath, rawFileName);
+        processedFilePath = fullfile(processedDataPath, processedFileName);
 
-% Parallelized loop
-parfor idx = 1:(numClasses * numSamplesPerClass)
-    % Compute class and sample indices
-    classIdx = ceil(idx / numSamplesPerClass);
-    sampleIdx = mod(idx - 1, numSamplesPerClass) + 1;
+        % Check if the file is already processed
+        if ~exist(processedFilePath, 'file')
+            % Read raw image
+            img = imread(rawFilePath);
 
-    % Construct file name
-    fileName = sprintf('%d_%d.tif', classIdx, sampleIdx);
-    filePath = fullfile(rawDataPath, fileName);
+            % Preprocess image
+            preprocessedImg = preprocessFingerprint(img);
 
-    % Read and preprocess image
-    img = imread(filePath);
-    preprocessedImg = preprocessFingerprint(img);
+            % Save the processed image
+            imwrite(preprocessedImg, processedFilePath);
+        else
+            % Load the preprocessed image
+            preprocessedImg = imread(processedFilePath);
+        end
 
-    % Feature extraction
-    minutiaeCell{idx} = extractMinutiaeFeatures(preprocessedImg);
-    textureCell{idx} = extractTextureFeatures(preprocessedImg);
-    labelCell{idx} = classIdx;
+        % Feature extraction
+        minutiaeFeatures = extractMinutiaeFeatures(preprocessedImg);
+        textureFeatures = extractTextureFeatures(preprocessedImg);
+
+        % Store features and labels
+        featuresMinutiae = [featuresMinutiae; minutiaeFeatures];
+        featuresTexture = [featuresTexture; textureFeatures];
+        labels = [labels; classIdx];
+    end
 end
-
-% Convert cell arrays to matrices
-featuresMinutiae = cell2mat(minutiaeCell);
-featuresTexture = cell2mat(textureCell);
-labels = cell2mat(labelCell);
 
 %% Split Data into Training and Testing Sets
 % Use 70% for training and 30% for testing
@@ -90,22 +90,27 @@ for methodIdx = 1:length(methods)
             testData = testTexture;
         end
 
+        trainData = zscore(trainData);
+        testData = zscore(testData);
+
         if classifierIdx == 1
             % Train SVM (using fitcecoc for multiclass support)
-            model = fitcecoc(trainData, trainLabels, 'Coding', 'onevsall', 'Learners', templateSVM('KernelFunction', 'linear'));
+            t = templateSVM('KernelFunction', 'rbf', 'KernelScale', 'auto', 'BoxConstraint', 1);
+            model = fitcecoc(trainData, trainLabels, 'Learners', t, 'Coding', 'onevsall');
             [predictions, scores] = predict(model, testData);
         else
             % Train k-NN
-            model = fitcknn(trainData, trainLabels, 'NumNeighbors', 5);
+            model = fitcknn(trainData, trainLabels, 'NumNeighbors', 5, ...
+                'Distance', 'euclidean', 'DistanceWeight', 'inverse', 'Standardize', true);
             [predictions, scores] = predict(model, testData);
         end
-
+        
         % Evaluate performance
         [X, Y, T, AUC] = perfcurve(testLabels, scores(:, 2), 1);
 
         % Store results
         results.(methods{methodIdx}).(classifiers{classifierIdx}) = struct(...
-            'X', X, 'Y', Y, 'AUC', AUC);
+        'X', X, 'Y', Y, 'AUC', AUC);
 
         % Get ROC data
         X = results.(methods{methodIdx}).(classifiers{classifierIdx}).X;
@@ -125,10 +130,6 @@ title('Comparison of ROC Curves');
 xlabel('False Positive Rate');
 ylabel('True Positive Rate');
 legend(legendEntries, 'Location', 'SouthEast');
-
-%% Cleanup Parallel Pool
-% Shut down the parallel pool after completion
-delete(gcp);
 
 %% Helper Functions
 function features = extractMinutiaeFeatures(img)
